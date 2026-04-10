@@ -9,10 +9,10 @@ from pathlib import Path
 from typing import Iterable
 
 import streamlit as st
-from langchain.document_loaders import WebBaseLoader
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import FAISS
+import faiss
+import numpy as np
+import requests
+from bs4 import BeautifulSoup
 
 
 # macOS: torch + faiss can load two OpenMP runtimes; without this the process may abort.
@@ -21,6 +21,8 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 APP_TITLE = "NewsURL — News Research"
 PERSIST_DIR = Path(".cache/faiss_news_index")
+PERSIST_DIR_INDEX = PERSIST_DIR / "index.faiss"
+PERSIST_DIR_META = PERSIST_DIR / "meta.json"
 
 
 def load_dotenv_simple(path: Path) -> None:
@@ -73,6 +75,73 @@ def format_source_label(url: str) -> str:
     return f"{host}/{path[:48]}{'…' if len(path) > 48 else ''}"
 
 
+def _fetch_article_text(url: str, timeout_s: int = 20) -> str:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0 Safari/537.36"
+        )
+    }
+    r = requests.get(url, headers=headers, timeout=timeout_s)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    # remove noisy tags
+    for tag in soup(["script", "style", "noscript", "svg"]):
+        tag.decompose()
+
+    # Prefer main/article if present, else fallback to body
+    root = soup.find("article") or soup.find("main") or soup.body or soup
+    text = root.get_text("\n", strip=True)
+    # collapse excessive blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+
+def _chunk_text(text: str, *, chunk_size: int, chunk_overlap: int) -> list[str]:
+    if chunk_size <= 0:
+        return []
+    overlap = max(0, min(chunk_overlap, chunk_size - 1))
+    out: list[str] = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + chunk_size)
+        out.append(text[start:end])
+        if end == len(text):
+            break
+        start = end - overlap
+    return out
+
+
+def _embed_texts_local(texts: list[str]) -> np.ndarray:
+    from sentence_transformers import SentenceTransformer
+
+    model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    emb = model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+    arr = np.asarray(emb, dtype=np.float32)
+    return arr
+
+
+def _embed_texts_gemini(texts: list[str], google_api_key: str) -> np.ndarray:
+    from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+    emb = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001", google_api_key=google_api_key)
+    vecs = emb.embed_documents(texts)
+    arr = np.asarray(vecs, dtype=np.float32)
+    return arr
+
+
+def _embed_query(text: str, *, mode: str, google_api_key: str) -> np.ndarray:
+    if mode == "gemini":
+        from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+        emb = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001", google_api_key=google_api_key)
+        v = np.asarray(emb.embed_query(text), dtype=np.float32)
+        return v
+    return _embed_texts_local([text])[0]
+
+
 @dataclass(frozen=True)
 class BuildStats:
     urls: list[str]
@@ -95,57 +164,65 @@ def get_google_api_key() -> str:
     return secrets_key or env_key
 
 
-def get_embeddings(mode: str, google_api_key: str):
-    if mode == "gemini":
-        from langchain_google_genai import GoogleGenerativeAIEmbeddings
-
-        return GoogleGenerativeAIEmbeddings(
-            model="gemini-embedding-001",
-            google_api_key=google_api_key,
-        )
-    return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-
-
 def build_vectorstore(urls: list[str], *, chunk_size: int, chunk_overlap: int, embeddings_mode: str, google_api_key: str):
-    loader = WebBaseLoader(urls, continue_on_failure=True)
-    pages = loader.load()
-    if not pages or all(not (d.page_content or "").strip() for d in pages):
-        raise ValueError("No readable content loaded from the provided URLs.")
+    texts: list[str] = []
+    metas: list[dict] = []
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""],
-    )
-    chunks = splitter.split_documents(pages)
-    if not chunks:
-        raise ValueError("Loaded pages produced 0 text chunks. Try different URLs.")
+    for url in urls:
+        txt = _fetch_article_text(url)
+        if not txt.strip():
+            continue
+        chunks = _chunk_text(txt, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        for c in chunks:
+            if c.strip():
+                texts.append(c)
+                metas.append({"source": url})
 
-    embeddings = get_embeddings(embeddings_mode, google_api_key)
-    vs = FAISS.from_documents(chunks, embeddings)
-    return vs, len(pages), len(chunks), embeddings_mode
+    if not texts:
+        raise ValueError("No readable text extracted from the provided URLs.")
+
+    if embeddings_mode == "gemini":
+        vecs = _embed_texts_gemini(texts, google_api_key)
+    else:
+        vecs = _embed_texts_local(texts)
+
+    dim = vecs.shape[1]
+    index = faiss.IndexFlatIP(dim)
+    index.add(vecs)
+    meta = {"texts": texts, "metas": metas, "mode": embeddings_mode}
+    return index, meta, len(urls), len(texts), embeddings_mode
 
 
-def save_vectorstore(vs: FAISS) -> None:
+def save_vectorstore(index: faiss.Index, meta: dict) -> None:
+    import json
+
     PERSIST_DIR.mkdir(parents=True, exist_ok=True)
-    vs.save_local(str(PERSIST_DIR))
+    faiss.write_index(index, str(PERSIST_DIR_INDEX))
+    PERSIST_DIR_META.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
 
 
-def load_vectorstore(embeddings_mode: str, google_api_key: str) -> FAISS | None:
-    if not PERSIST_DIR.is_dir():
+def load_vectorstore() -> tuple[faiss.Index, dict] | None:
+    import json
+
+    if not PERSIST_DIR_INDEX.is_file() or not PERSIST_DIR_META.is_file():
         return None
-    embeddings = get_embeddings(embeddings_mode, google_api_key)
-    return FAISS.load_local(str(PERSIST_DIR), embeddings)
+    index = faiss.read_index(str(PERSIST_DIR_INDEX))
+    meta = json.loads(PERSIST_DIR_META.read_text(encoding="utf-8"))
+    return index, meta
 
 
-def retrieve_sources(docs: Iterable) -> list[str]:
-    srcs: list[str] = []
-    for d in docs:
-        meta = getattr(d, "metadata", {}) or {}
-        src = meta.get("source") or meta.get("url")
-        if src and src not in srcs:
-            srcs.append(src)
-    return srcs
+def search_index(index: faiss.Index, meta: dict, *, query: str, k: int, google_api_key: str) -> list[dict]:
+    mode = meta.get("mode", "local")
+    qv = _embed_query(query, mode=mode, google_api_key=google_api_key).astype(np.float32)
+    D, I = index.search(np.expand_dims(qv, axis=0), k)
+    hits: list[dict] = []
+    for score, idx in zip(D[0].tolist(), I[0].tolist()):
+        if idx < 0:
+            continue
+        txt = meta["texts"][idx]
+        m = meta["metas"][idx]
+        hits.append({"score": float(score), "text": txt, "meta": m})
+    return hits
 
 
 def answer_from_evidence_only(*, question: str, retrieved_docs: list) -> str:
@@ -158,7 +235,7 @@ def answer_from_evidence_only(*, question: str, retrieved_docs: list) -> str:
     if not retrieved_docs:
         return "No evidence retrieved for this question."
 
-    combined = "\n".join((d.page_content or "") for d in retrieved_docs[:6])
+    combined = "\n".join((d.get("text") or "") for d in retrieved_docs[:6])
     # Cricket-specific heuristic for common query here: "playing 11 of <team>"
     if any(k in q for k in ("playing 11", "playing xi", "playing eleven", "playing11")):
         # Try to locate "Royal Challengers Bengaluru" roster chunk from the evidence
@@ -188,7 +265,7 @@ def answer_from_evidence_only(*, question: str, retrieved_docs: list) -> str:
 
     # Generic fallback: show the most relevant snippet from the top document
     best = retrieved_docs[0]
-    txt = (best.page_content or "").strip()
+    txt = (best.get("text") or "").strip()
     if not txt:
         return "Top retrieved document had no text content."
     snippet = txt[:900] + ("…" if len(txt) > 900 else "")
@@ -199,7 +276,7 @@ def answer_with_gemini(*, question: str, retrieved_docs: list, google_api_key: s
     from langchain_google_genai import ChatGoogleGenerativeAI
     from langchain_core.messages import HumanMessage
 
-    context = "\n\n".join(d.page_content for d in retrieved_docs[:8])
+    context = "\n\n".join(d.get("text", "") for d in retrieved_docs[:8])
     llm = ChatGoogleGenerativeAI(
         model="gemini-2.0-flash",
         google_api_key=google_api_key,
@@ -243,6 +320,8 @@ has_real_key = looks_like_google_api_key(google_api_key)
 
 if "vectorstore" not in st.session_state:
     st.session_state.vectorstore = None
+if "vector_meta" not in st.session_state:
+    st.session_state.vector_meta = None
 if "build_stats" not in st.session_state:
     st.session_state.build_stats = None
 if "embeddings_mode" not in st.session_state:
@@ -301,6 +380,7 @@ with st.sidebar:
 
     if clear_clicked:
         st.session_state.vectorstore = None
+        st.session_state.vector_meta = None
         st.session_state.build_stats = None
         if PERSIST_DIR.is_dir():
             # Best-effort cleanup
@@ -316,7 +396,7 @@ with st.sidebar:
         else:
             try:
                 prog = st.progress(0, text="Loading pages…")
-                vs, pages, chunks, mode = build_vectorstore(
+                index, meta, pages, chunks, mode = build_vectorstore(
                     urls,
                     chunk_size=chunk_size,
                     chunk_overlap=chunk_overlap,
@@ -324,9 +404,10 @@ with st.sidebar:
                     google_api_key=google_api_key,
                 )
                 prog.progress(70, text="Saving index…")
-                save_vectorstore(vs)
+                save_vectorstore(index, meta)
                 prog.progress(100, text="Done")
-                st.session_state.vectorstore = vs
+                st.session_state.vectorstore = index
+                st.session_state.vector_meta = meta
                 st.session_state.build_stats = BuildStats(
                     urls=urls,
                     pages=pages,
@@ -337,6 +418,7 @@ with st.sidebar:
                 st.success(f"Index ready ({pages} page(s), {chunks} chunk(s)).")
             except Exception as exc:
                 st.session_state.vectorstore = None
+                st.session_state.vector_meta = None
                 st.session_state.build_stats = None
                 st.error(f"Index build failed: {exc}")
 
@@ -399,25 +481,33 @@ with tab_ask:
         go = st.button("Answer", type="primary", disabled=not bool(question))
 
         if go:
-            vs = st.session_state.vectorstore
-            if vs is None:
-                # try loading from disk
-                vs = load_vectorstore(st.session_state.embeddings_mode, google_api_key)
-                st.session_state.vectorstore = vs
+            index = st.session_state.vectorstore
+            meta = st.session_state.vector_meta
+            if index is None or meta is None:
+                loaded = load_vectorstore()
+                if loaded:
+                    index, meta = loaded
+                    st.session_state.vectorstore = index
+                    st.session_state.vector_meta = meta
 
-            if vs is None:
+            if index is None or meta is None:
                 st.warning("No index found. Build the index in the sidebar first.")
             else:
                 with st.spinner("Retrieving the most relevant chunks…"):
-                    retriever = vs.as_retriever(search_kwargs={"k": k})
-                    retrieved_docs = retriever.get_relevant_documents(question)
+                    retrieved_docs = search_index(
+                        index,
+                        meta,
+                        query=question,
+                        k=k,
+                        google_api_key=google_api_key,
+                    )
 
                 st.markdown("### Retrieved evidence")
                 for i, d in enumerate(retrieved_docs[: min(k, 8)], start=1):
-                    src = (d.metadata or {}).get("source") or ""
+                    src = (d.get("meta") or {}).get("source") or ""
                     title = format_source_label(src) if src else "Source"
                     with st.expander(f"{i}. {title}", expanded=(i <= 2)):
-                        st.write(d.page_content[:1800])
+                        st.write((d.get("text") or "")[:1800])
                         if src:
                             st.markdown(f"**URL**: [{src}]({src})")
 
@@ -459,7 +549,11 @@ with tab_ask:
                                     )
                             st.info(answer_from_evidence_only(question=question, retrieved_docs=retrieved_docs))
 
-                srcs = retrieve_sources(retrieved_docs)
+                srcs = []
+                for d in retrieved_docs:
+                    src = (d.get("meta") or {}).get("source") or ""
+                    if src and src not in srcs:
+                        srcs.append(src)
                 if srcs:
                     st.markdown("### Sources")
                     for u in srcs:
