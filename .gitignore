@@ -1,0 +1,25 @@
+.env
+.env.*
+
+# Streamlit / app cache
+.cache/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+
+# Notebook checkpoints
+**/.ipynb_checkpoints/
+
+# Generated vector stores / artifacts
+notebooks/faiss_retrieval_index/
+notebooks/vector_index.pkl
+
