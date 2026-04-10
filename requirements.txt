@@ -1,0 +1,26 @@
+# NewsURL requirements
+# - Designed for local runs and Streamlit Community Cloud.
+# - The app supports two modes:
+#   - Gemini embeddings + Gemini answers (requires GOOGLE_API_KEY / GEMINI_API_KEY)
+#   - Local embeddings via sentence-transformers (no key required; heavier deps)
+
+# UI
+streamlit>=1.30,<2
+
+# Core LangChain stack used by the current app code
+langchain==0.0.284
+
+# Gemini integration (used for embeddings + chat invoke)
+langchain-google-genai>=4.2.1,<5
+google-generativeai>=0.8,<1
+google-genai>=1.56,<2
+
+# Vector store
+faiss-cpu>=1.7.4,<2
+
+# Local embedding fallback (brings torch via dependency chain)
+sentence-transformers>=2.7,<6
+
+# Content loading
+beautifulsoup4>=4.12,<5
+requests>=2.31,<3
